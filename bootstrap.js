@@ -1,6 +1,3 @@
-// 페일 문에서 탭을 닫을 때마다 메모리를 정리한다. 탭을 닫을 때마다 화면끊김이 좀 있지만 효과는 있음.
-//   작성일: 2026-07-18
-
 // 컴포넌트 별칭
 const { classes: Cc, interfaces: Ci, utils: Cu } = Components;
 // 메모리 관리자
@@ -11,6 +8,10 @@ const runtime = Cc["@mozilla.org/xre/app-info;1"].getService(Ci.nsIXULRuntime);
 Cu.import('resource://gre/modules/Services.jsm');
 // Windows API 직접 호출
 Cu.import("resource://gre/modules/ctypes.jsm");
+
+// 설정 분기
+const branch = 'extensions.free_memory_on_close.';
+const prefBranch = Services.prefs.getBranch(branch);
 
 // Windows API 라이브러리 (startup에서 불러옴, 코틀린같은 late init val이 불가능해서 어쩔 수 없이 var)
 var kernel32 = null;
@@ -23,6 +24,9 @@ var EmptyWorkingSet = null;
 // 탭 닫기 이벤트 핸들러가 붙은 창 목록 (확장 프로그램 비활성화 시 필요)
 //   어차피 창이 닫힐 때 제거되므로 굳이 WeakSet는 안 써도 된다.
 const attachedWindows = [];
+
+// 페이지 언로드 이벤트를 감지할 창 모음
+const openPages = {};
 
 // 실행할 메모리 정리 타이머
 var freeTask = null;
@@ -85,22 +89,28 @@ function freeMemory() {
 		freeTaskRunning = true;
 
 		// 쓰레기 수집
-		Services.obs.notifyObservers(null, 'child-gc-request', null);
-		Cu.forceGC();
+		if(Services.prefs.getBoolPref(branch + 'gc')) {
+			Services.obs.notifyObservers(null, 'child-gc-request', null);
+			Cu.forceGC();
+		}
 
 		// 메모리 사용량 최소화 (minimise memory usage)
-		Services.obs.notifyObservers(null, 'child-mmu-request', null);
-		await minimizeMemoryUsage();
+		if(Services.prefs.getBoolPref(branch + 'minimize_memory_usage')) {
+			Services.obs.notifyObservers(null, 'child-mmu-request', null);
+			await minimizeMemoryUsage();
+		}
 
 		// 작업 집합 정리
-		emptyWorkingSet();
+		if(Services.prefs.getBoolPref(branch + 'empty_working_set')) {
+			emptyWorkingSet();
+		}
 
 		/* Services.prompt.alert(null, null, '메모리 정리 완료'); */
 
 		// 작업 초기화
 		freeTask = null;
 		freeTaskRunning = false;
-	}, 500);  // 탭 닫힘 애니메이션을 재생하기 위해 0.5초 뒤 정리 (그냥 눈속임)
+	}, Services.prefs.getIntPref(branch + 'free_delay'));  // 탭 닫힘 애니메이션을 재생하기 위해 1초 뒤 정리 (그냥 눈속임)
 }
 
 // 탭 닫기 이벤트 수신기 부착
@@ -131,7 +141,7 @@ function detachHandler(domWindow) {
 
 // 붙어 있던 모든 탭 닫기 감지기 해제
 function detachAllHandlers() {
-	for(var domWindow of attachedWindows)
+	for(const domWindow of attachedWindows)
 		domWindow.gBrowser.tabContainer.removeEventListener('TabClose', freeMemory);
 	attachedWindows.length = 0;
 }
@@ -160,6 +170,124 @@ const windowListener = {
 		freeMemory();
 	},
 };
+
+// 페이지가 로드될 때를 감지
+const createObserver = {
+	observe(subject, topic, data) {
+		// DOM 창이 아니면 건너뛰기
+		if(!(subject instanceof Ci.nsIDOMWindow)) return;
+
+		// '웹' 창이 아니면 건너뛰기
+		try {
+			subject.QueryInterface(Ci.nsIDOMChromeWindow);
+			return;
+		} catch(e) {}
+
+		// top-level이 아닌 페이지는 건너뛰기
+		if(subject !== subject.top) return;
+
+		// 내부 페이지는 건너뛰기
+		const uri = subject.document.documentURI;
+		if(!uri || uri.startsWith("about:") || uri.startsWith("chrome:") || uri.startsWith("resource:")) return;
+
+		// 맵에 등록
+		const id = subject.QueryInterface(Ci.nsIInterfaceRequestor).getInterface(Ci.nsIDOMWindowUtils).currentInnerWindowID;
+		openPages[id] = uri;
+
+		/* console.log(`[Freemem] ${uri}(${id}) 열림`); */
+	},
+
+	register() {
+		Services.obs.addObserver(this, 'content-document-global-created', false);
+	},
+
+	unregister() {
+		Services.obs.removeObserver(this, 'content-document-global-created');
+	},
+};
+
+// 페이지가 언로드될 때를 감지
+const destroyObserver = {
+	observe(subject, topic, data) {
+		const id = subject.QueryInterface(Ci.nsISupportsPRUint64).data;
+
+		// 등록된 페이지가 아니면 건너뛰기
+		if(!openPages[id]) return;
+
+		/* console.log(`[Freemem] ${openPages[id]}(${id}) 닫힘`); */
+
+		// 등록 해제
+		delete openPages[id];
+
+		// 메모리 정리
+		freeMemory();
+	},
+
+	register() {
+		Services.obs.addObserver(this, 'inner-window-destroyed', false);
+	},
+
+	unregister() {
+		Services.obs.removeObserver(this, 'inner-window-destroyed');
+	},
+};
+
+// 설정 변경 감지기
+const prefObserver = {
+	observe(subject, topic, data) {
+		// 바뀐 게 아니라면 취소
+		if(topic !== 'nsPref:changed') return;
+
+		// 새 값 가져오기
+		const value = Services.prefs.getBoolPref(branch + data);
+
+		/* Services.prompt.alert(null, null, `설정 변경: ${data} -> ${value}`); */
+
+		// 새 설정과 값에 따라 작업 실행
+		switch(data) {
+			case 'free_on_page_unload': {
+				if(value) {
+					createObserver.register();
+					destroyObserver.register();
+				} else {
+					createObserver.unregister();
+					destroyObserver.unregister();
+				}
+			} break; case 'free_on_close': {
+				if(value) {
+					processWindows(attachHandler);
+					Services.wm.addListener(windowListener);
+				} else {
+					Services.wm.removeListener(windowListener);
+					detachAllHandlers();
+				}
+			}
+		}
+	},
+
+	register() {
+		prefBranch.addObserver('', this, false);
+	},
+
+	unregister() {
+		prefBranch.removeObserver('', this);
+	},
+};
+
+// 설정 등록
+function initPreferences() {
+	// 설정 기본값 분기
+	const defaultBranch = Services.prefs.getDefaultBranch(branch);
+
+	// 기본값 등록
+	defaultBranch.setBoolPref('gc', true);
+	defaultBranch.setBoolPref('minimize_memory_usage', false);  // 끊김이 좀 심해서 false
+	if(runtime.OS === 'WINNT')
+		defaultBranch.setBoolPref('empty_working_set', false);  // 작업 관리자에서 보이는 사용량만 줄고 실제 효과는 거의 없어서 기본 false
+	defaultBranch.setBoolPref('free_on_close', false);  // free_on_page_unload와 역할이 살짝 중복되는 면이 있음
+	defaultBranch.setBoolPref('free_on_page_unload', true);
+	defaultBranch.setIntPref('free_delay', 1000);
+}
 
 // Windows API 함수 불러오기
 function loadWinapi() {
@@ -191,14 +319,28 @@ function unloadWinapi() {
 
 // 확장 프로그램이 활성화될 때
 function startup(data, reason) {
+	// 기본 설정 등록
+	initPreferences();
+
 	// Windows API 함수 불러오기
 	loadWinapi();
 
-	// 기존 창에 탭 닫기 이벤트 수신기 붙이기
-	processWindows(attachHandler);
+	if(Services.prefs.getBoolPref(branch + 'free_on_close')) {
+		// 기존 창에 탭 닫기 이벤트 수신기 붙이기
+		processWindows(attachHandler);
 
-	// 창 열기 이벤트 감지기 등록
-	Services.wm.addListener(windowListener);
+		// 창 열기 이벤트 감지기 등록
+		Services.wm.addListener(windowListener);
+	}
+
+	// 웹 페이지 언로드 이벤트 감지기 등록
+	if(Services.prefs.getBoolPref(branch + 'free_on_page_unload')) {
+		createObserver.register();
+		destroyObserver.register();
+	}
+
+	// 설정 변경 감지기 등록
+	prefObserver.register();
 }
 
 // 확장 프로그램이 비활성화될 때
@@ -206,14 +348,25 @@ function shutdown(data, reason) {
 	// 메모리 정리 작업 취소
 	freeTask?.cancel();
 
-	// 창 열기 이벤트 감지기 해제
-	Services.wm.removeListener(windowListener);
+	// 웹 페이지 언로드 이벤트 감지기 해제
+	if(Services.prefs.getBoolPref(branch + 'free_on_page_unload')) {
+		createObserver.unregister();
+		destroyObserver.unregister();
+	}
 
-	// 이미 붙어 있던 탭 닫기 감지기 해제
-	detachAllHandlers();
+	if(Services.prefs.getBoolPref(branch + 'free_on_close')) {
+		// 창 열기 이벤트 감지기 해제
+		Services.wm.removeListener(windowListener);
+
+		// 이미 붙어 있던 탭 닫기 감지기 해제
+		detachAllHandlers();
+	}
 
 	// Windows API 라이브러리 닫기
 	unloadWinapi();
+
+	// 설정 변경 감지기 해제
+	prefObserver.unregister();
 }
 
 // 확장 프로그램이 설치될 때
